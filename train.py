@@ -1,6 +1,6 @@
 # train.py
-# Minimal PPO training with clean logs every fixed step bucket (default: 10,000).
-# Prints per bucket: progress %, steps, sps, elapsed, ETA, eps, ep_r100, ep_len100, x_max100, flag@100.
+# PPO training with clean bucket logs + per-episode CSV logs.
+# Files saved under: ./train/<tag>/  ->  {best_model_*.zip, final_model.zip, episodes.csv, metrics_bucket.csv, config.json}
 
 import warnings
 warnings.filterwarnings("ignore", message="overflow encountered", category=RuntimeWarning)
@@ -8,6 +8,7 @@ warnings.filterwarnings("ignore", message="overflow encountered", category=Runti
 from typing import Optional
 import argparse
 import os
+import json
 import time
 from datetime import timedelta, datetime
 from collections import deque
@@ -36,13 +37,77 @@ class TrainAndLoggingCallback(BaseCallback):
         return True
 
 
-class StepBucketLogger(BaseCallback):
+class EpisodeCSVLogger(BaseCallback):
     """
-    Log once per fixed step bucket (e.g., every 10,000 steps).
+    Write one row per *completed* episode:
+    columns = [global_step, episode_idx, reward, length, x_max, flag]
+    """
+    def __init__(self, save_dir: str, verbose: int = 0):
+        super().__init__(verbose)
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.fpath = os.path.join(self.save_dir, "episodes.csv")
+        self.fh = None
+        self.header_written = False
+        self.episode_idx = 0
+        self.max_x = None  # per-env running x max
+
+    def _ensure_max_x(self):
+        try:
+            n = getattr(self.training_env, "num_envs", 1)
+        except Exception:
+            n = 1
+        if self.max_x is None or len(self.max_x) != n:
+            self.max_x = [0 for _ in range(n)]
+
+    def _on_training_start(self) -> None:
+        self._ensure_max_x()
+        self.fh = open(self.fpath, "a", buffering=1)  # line-buffered
+        if not self.header_written and (self.fh.tell() == 0):
+            self.fh.write("global_step,episode_idx,reward,length,x_max,flag\n")
+            self.header_written = True
+
+    def _on_step(self) -> bool:
+        self._ensure_max_x()
+        infos = self.locals.get("infos", None)
+        if infos is None:
+            return True
+
+        for i, info in enumerate(infos):
+            x = info.get("x_pos", None)
+            if x is not None and i < len(self.max_x) and x > self.max_x[i]:
+                self.max_x[i] = x
+
+            ep = info.get("episode")
+            if ep:
+                self.episode_idx += 1
+                r = float(ep.get("r", 0.0))
+                l = float(ep.get("l", 0.0))
+                x_max = float(self.max_x[i] if i < len(self.max_x) else 0.0)
+                flag = 1 if info.get("flag_get") else 0
+                gstep = int(self.model.num_timesteps)
+                self.fh.write(f"{gstep},{self.episode_idx},{r},{l},{x_max},{flag}\n")
+                if i < len(self.max_x):
+                    self.max_x[i] = 0  # reset for next episode
+
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.fh is not None:
+            self.fh.flush()
+            self.fh.close()
+            self.fh = None
+
+
+class BucketCSVLogger(BaseCallback):
+    """
+    Log once per fixed step bucket (e.g., every 50,000 steps) and write to metrics_bucket.csv.
     Rolling metrics are computed over the last 'window' completed episodes.
     """
-    def __init__(self, total_timesteps: int, bucket: int = 10_000, window: int = 100, verbose: int = 1):
+    def __init__(self, save_dir: str, total_timesteps: int, bucket: int = 50_000, window: int = 100, verbose: int = 1):
         super().__init__(verbose)
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
         self.total = int(total_timesteps)
         self.bucket = max(1, int(bucket))
         self.window = int(window)
@@ -56,6 +121,10 @@ class StepBucketLogger(BaseCallback):
         self.start_time = 0.0
         self.last_bucket_idx = -1
         self.completed_eps = 0
+
+        self.fpath = os.path.join(self.save_dir, "metrics_bucket.csv")
+        self.fh = None
+        self.header_written = False
 
     def _ensure_max_x(self):
         try:
@@ -79,6 +148,10 @@ class StepBucketLogger(BaseCallback):
     def _on_training_start(self) -> None:
         self.start_time = time.time()
         self._ensure_max_x()
+        self.fh = open(self.fpath, "a", buffering=1)
+        if not self.header_written and (self.fh.tell() == 0):
+            self.fh.write("global_step,pct,sps,elapsed_s,eta_s,episodes,ep_r100,ep_len100,x_max100,flag@100\n")
+            self.header_written = True
 
     def _maybe_log(self):
         n = self.model.num_timesteps
@@ -100,10 +173,10 @@ class StepBucketLogger(BaseCallback):
         x100 = _mean(self.ep_xmax)
         f100 = (_mean(self.ep_flag) * 100.0) if len(self.ep_flag) > 0 else float("nan")
 
+        # Console line
         elapsed_td = str(timedelta(seconds=int(elapsed)))
         eta_td = str(timedelta(seconds=int(eta_sec)))
         eta_abs = (datetime.now() + timedelta(seconds=int(eta_sec))).strftime("%H:%M:%S")
-
         print(
             f"{pct:5.1f}% | {n:,}/{self.total:,} steps | {int(sps):4d} sps | "
             f"elapsed {elapsed_td} | ETA {eta_td} (~{eta_abs}) | "
@@ -112,11 +185,15 @@ class StepBucketLogger(BaseCallback):
             f"x_max100 {self._fmt(x100)} | flag@100 {self._fmt(f100)}%",
             flush=True,
         )
+
+        # CSV line
+        self.fh.write(f"{n},{pct:.2f},{sps:.2f},{elapsed:.1f},{eta_sec:.1f},{self.completed_eps},{self._fmt(r100)},{self._fmt(l100)},{self._fmt(x100)},{self._fmt(f100)}\n")
+
         self.last_bucket_idx = cur_bucket
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", None)
         self._ensure_max_x()
+        infos = self.locals.get("infos", None)
         if infos is not None:
             for i, info in enumerate(infos):
                 x = info.get("x_pos", None)
@@ -131,10 +208,16 @@ class StepBucketLogger(BaseCallback):
                     self.ep_xmax.append(float(self.max_x[i] if i < len(self.max_x) else 0.0))
                     self.ep_flag.append(1.0 if info.get("flag_get") else 0.0)
                     if i < len(self.max_x):
-                        self.max_x[i] = 0  # reset per-env x_max for next episode
+                        self.max_x[i] = 0  # reset for next episode
 
         self._maybe_log()
         return True
+
+    def _on_training_end(self) -> None:
+        if self.fh is not None:
+            self.fh.flush()
+            self.fh.close()
+            self.fh = None
 
 
 # ---------- Main training ----------
@@ -170,6 +253,18 @@ def main(
     seed_everything(seed)
     ckpt_dir, log_dir = default_paths(".", tag=f"ppo_s{seed}")
 
+    # Save config snapshot for reproducibility
+    run_cfg = dict(
+        total_steps=total_steps, lr=lr, n_steps=n_steps, batch_size=batch_size,
+        ent_coef=ent_coef, gamma=gamma, check_freq=check_freq, seed=seed,
+        num_envs=num_envs, resize=resize, frame_stack=frame_stack, level_id=level_id,
+        use_macros=use_macros, use_shaping=use_shaping, use_stuck=use_stuck, use_resize=use_resize,
+        action_set=action_set, stuck_patience=stuck_patience, max_episode_steps=max_episode_steps,
+        device=device, no_tb=no_tb, target_kl=target_kl, log_bucket=log_bucket
+    )
+    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
+        json.dump(run_cfg, f, indent=2)
+
     env = make_env(
         num_envs=num_envs,
         grayscale=True,
@@ -190,7 +285,7 @@ def main(
     model = PPO(
         "CnnPolicy",
         env,
-        verbose=0,  # logs are handled by our callback
+        verbose=0,  # logs handled by our callbacks
         tensorboard_log=None if no_tb else log_dir,
         learning_rate=lr,
         n_steps=n_steps,               # per env
@@ -204,13 +299,14 @@ def main(
         target_kl=target_kl,           # None to disable KL early stop
     )
 
-    cb_ckpt = TrainAndLoggingCallback(check_freq=check_freq, save_path=ckpt_dir)
-    cb_log  = StepBucketLogger(total_timesteps=total_steps, bucket=log_bucket, window=100)
+    cb_ckpt   = TrainAndLoggingCallback(check_freq=check_freq, save_path=ckpt_dir)
+    cb_epcsv  = EpisodeCSVLogger(save_dir=ckpt_dir)
+    cb_bucket = BucketCSVLogger(save_dir=ckpt_dir, total_timesteps=total_steps, bucket=log_bucket, window=100)
 
-    model.learn(total_timesteps=total_steps, callback=[cb_ckpt, cb_log])
+    model.learn(total_timesteps=total_steps, callback=[cb_ckpt, cb_epcsv, cb_bucket])
 
     model.save(os.path.join(ckpt_dir, "final_model"))
-    print(f"\nTraining finished. Checkpoints in: {ckpt_dir}")
+    print(f"\nTraining finished. Run artifacts in: {ckpt_dir}")
     env.close()
 
 
@@ -249,7 +345,7 @@ if __name__ == "__main__":
 
     # Logging
     ap.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
-    ap.add_argument("--log_bucket", type=int, default=50_000, help="Print metrics once per this many steps")
+    ap.add_argument("--log_bucket", type=int, default=50_000, help="Print & CSV once per this many steps")
 
     args = ap.parse_args()
     main(**vars(args))
