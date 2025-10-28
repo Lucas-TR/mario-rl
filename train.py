@@ -1,13 +1,13 @@
 # train.py
-# Minimal PPO training script with newline progress + rolling metrics (no progress bar).
-# Prints: steps/total, %, sps, elapsed, ETA, ep_r100, ep_len100, x_max100, flag@100.
+# Minimal PPO training with clean logs every fixed step bucket (default: 10,000).
+# Prints per bucket: progress %, steps, sps, elapsed, ETA, eps, ep_r100, ep_len100, x_max100, flag@100.
 
 import warnings
 warnings.filterwarnings("ignore", message="overflow encountered", category=RuntimeWarning)
 
+from typing import Optional
 import argparse
 import os
-import sys
 import time
 from datetime import timedelta, datetime
 from collections import deque
@@ -19,11 +19,11 @@ from mario_env import make_env
 from utils import default_paths, seed_everything
 
 
-# -------------------- Callbacks --------------------
+# ---------- Callbacks ----------
 
 class TrainAndLoggingCallback(BaseCallback):
     """Save periodic checkpoints at 'check_freq' steps."""
-    def __init__(self, check_freq, save_path, verbose=1):
+    def __init__(self, check_freq: int, save_path: str, verbose: int = 1):
         super().__init__(verbose)
         self.check_freq = int(check_freq)
         self.save_path = save_path
@@ -36,36 +36,28 @@ class TrainAndLoggingCallback(BaseCallback):
         return True
 
 
-class ProgressAndMetricsCallback(BaseCallback):
+class StepBucketLogger(BaseCallback):
     """
-    Line-based progress + rolling metrics (works with TTY or pipes).
-    - Prints every `print_every_steps` or ~`print_every_sec`, whichever comes first.
-    - Metrics are rolling means over the last `window` episodes.
+    Log once per fixed step bucket (e.g., every 10,000 steps).
+    Rolling metrics are computed over the last 'window' completed episodes.
     """
-    def __init__(self, total_timesteps: int, print_every_steps: int = 10_000,
-                 print_every_sec: float = 2.0, window: int = 100, verbose: int = 1):
+    def __init__(self, total_timesteps: int, bucket: int = 10_000, window: int = 100, verbose: int = 1):
         super().__init__(verbose)
         self.total = int(total_timesteps)
-        self.print_every_steps = int(print_every_steps)
-        self.print_every_sec = float(print_every_sec)
+        self.bucket = max(1, int(bucket))
         self.window = int(window)
 
-        # rolling buffers
         self.ep_rewards = deque(maxlen=self.window)
         self.ep_lens    = deque(maxlen=self.window)
         self.ep_xmax    = deque(maxlen=self.window)
         self.ep_flag    = deque(maxlen=self.window)
 
-        # per-env trackers for x_pos max during an episode
-        self.max_x = None
-
-        # progress state
-        self.last_print_step = 0
-        self.last_print_time = 0.0
+        self.max_x = None  # per-env running max x during current episode
         self.start_time = 0.0
+        self.last_bucket_idx = -1
+        self.completed_eps = 0
 
     def _ensure_max_x(self):
-        # number of parallel envs
         try:
             n = getattr(self.training_env, "num_envs", 1)
         except Exception:
@@ -73,73 +65,79 @@ class ProgressAndMetricsCallback(BaseCallback):
         if self.max_x is None or len(self.max_x) != n:
             self.max_x = [0 for _ in range(n)]
 
+    def _fmt(self, x):
+        # Pretty print with '-' if NaN / empty
+        if x is None:
+            return "-"
+        try:
+            if isinstance(x, float) and (x != x):  # NaN check
+                return "-"
+            return f"{x:.2f}"
+        except Exception:
+            return str(x)
+
     def _on_training_start(self) -> None:
         self.start_time = time.time()
-        self.last_print_time = self.start_time
         self._ensure_max_x()
 
-    def _maybe_print(self):
+    def _maybe_log(self):
         n = self.model.num_timesteps
-        now = time.time()
-        if (n - self.last_print_step >= self.print_every_steps) or (now - self.last_print_time >= self.print_every_sec):
-            elapsed = now - self.start_time
-            sps = n / max(elapsed, 1e-9)
-            remaining = max(self.total - n, 0)
-            eta_sec = remaining / max(sps, 1e-9)
-            pct = 100.0 * n / max(self.total, 1)
+        cur_bucket = n // self.bucket
+        if cur_bucket <= self.last_bucket_idx:
+            return  # not yet crossed a bucket boundary
 
-            def _mean(q):
-                return float(sum(q)) / len(q) if len(q) > 0 else float("nan")
+        elapsed = time.time() - self.start_time
+        sps = n / max(elapsed, 1e-9)
+        remaining = max(self.total - n, 0)
+        eta_sec = remaining / max(sps, 1e-9)
+        pct = 100.0 * n / max(self.total, 1)
 
-            r100 = _mean(self.ep_rewards)
-            l100 = _mean(self.ep_lens)
-            x100 = _mean(self.ep_xmax)
-            f100 = (_mean(self.ep_flag) * 100.0) if len(self.ep_flag) > 0 else float("nan")
+        def _mean(q):
+            return float(sum(q)) / len(q) if len(q) > 0 else float("nan")
 
-            elapsed_td = str(timedelta(seconds=int(elapsed)))
-            eta_td = str(timedelta(seconds=int(eta_sec)))
-            eta_abs_str = (datetime.now() + timedelta(seconds=int(eta_sec))).strftime("%H:%M:%S")
+        r100 = _mean(self.ep_rewards)
+        l100 = _mean(self.ep_lens)
+        x100 = _mean(self.ep_xmax)
+        f100 = (_mean(self.ep_flag) * 100.0) if len(self.ep_flag) > 0 else float("nan")
 
-            print(
-                f"{pct:5.1f}% | {n:,}/{self.total:,} steps | {int(sps):4d} sps | "
-                f"elapsed {elapsed_td} | ETA {eta_td} (~{eta_abs_str}) | "
-                f"ep_r100 {r100:7.2f} | ep_len100 {l100:6.1f} | x_max100 {x100:6.1f} | "
-                f"flag@100 {f100:5.1f}%",
-                flush=True,
-            )
-            self.last_print_step = n
-            self.last_print_time = now
+        elapsed_td = str(timedelta(seconds=int(elapsed)))
+        eta_td = str(timedelta(seconds=int(eta_sec)))
+        eta_abs = (datetime.now() + timedelta(seconds=int(eta_sec))).strftime("%H:%M:%S")
 
+        print(
+            f"{pct:5.1f}% | {n:,}/{self.total:,} steps | {int(sps):4d} sps | "
+            f"elapsed {elapsed_td} | ETA {eta_td} (~{eta_abs}) | "
+            f"eps {self.completed_eps:,} | "
+            f"ep_r100 {self._fmt(r100)} | ep_len100 {self._fmt(l100)} | "
+            f"x_max100 {self._fmt(x100)} | flag@100 {self._fmt(f100)}%",
+            flush=True,
+        )
+        self.last_bucket_idx = cur_bucket
 
     def _on_step(self) -> bool:
-        # collect infos (VecEnv: list of dicts)
         infos = self.locals.get("infos", None)
         self._ensure_max_x()
         if infos is not None:
             for i, info in enumerate(infos):
-                # track per-episode max x
                 x = info.get("x_pos", None)
-                if x is not None and i < len(self.max_x):
-                    if x > self.max_x[i]:
-                        self.max_x[i] = x
-                # when an episode ends, Monitor inserts 'episode'
+                if x is not None and i < len(self.max_x) and x > self.max_x[i]:
+                    self.max_x[i] = x
+
                 ep = info.get("episode")
                 if ep:
+                    self.completed_eps += 1
                     self.ep_rewards.append(float(ep.get("r", 0.0)))
                     self.ep_lens.append(float(ep.get("l", 0.0)))
                     self.ep_xmax.append(float(self.max_x[i] if i < len(self.max_x) else 0.0))
                     self.ep_flag.append(1.0 if info.get("flag_get") else 0.0)
                     if i < len(self.max_x):
-                        self.max_x[i] = 0  # reset for next episode
+                        self.max_x[i] = 0  # reset per-env x_max for next episode
 
-        self._maybe_print()
+        self._maybe_log()
         return True
 
-    def _on_training_end(self) -> None:
-        print("Training finished step loop.", flush=True)
 
-
-# -------------------- Main training --------------------
+# ---------- Main training ----------
 
 def main(
     total_steps: int,
@@ -151,16 +149,23 @@ def main(
     check_freq: int,
     seed: int,
     num_envs: int,
-    pre_run_long: int,
-    pre_run_short: int,
-    jump_hold: int,
-    k_jump: int,
-    k_other: int,
+    # env visuals / level
     resize: int,
     frame_stack: int,
     level_id: str,
-    no_tb: bool,
+    # env toggles
+    use_macros: bool,
+    use_shaping: bool,
+    use_stuck: bool,
+    use_resize: bool,
+    action_set: str,
+    stuck_patience: int,
+    max_episode_steps: int,
+    # PPO / logging
     device: str,
+    no_tb: bool,
+    target_kl: Optional[float],
+    log_bucket: int,
 ):
     seed_everything(seed)
     ckpt_dir, log_dir = default_paths(".", tag=f"ppo_s{seed}")
@@ -168,36 +173,41 @@ def main(
     env = make_env(
         num_envs=num_envs,
         grayscale=True,
+        use_resize=use_resize,
         resize=resize,
         frame_stack=frame_stack,
         level_id=level_id,
-        pre_run_long=pre_run_long,
-        pre_run_short=pre_run_short,
-        jump_hold=jump_hold,
-        k_jump=k_jump,
-        k_other=k_other,
+        use_macros=use_macros,
+        use_shaping=use_shaping,
+        use_stuck=use_stuck,
+        action_set=action_set,
+        pre_run_long=10, pre_run_short=3, jump_hold=14,  # safe defaults
+        k_jump=10, k_other=2,
+        stuck_patience=stuck_patience,
+        max_episode_steps=max_episode_steps,
     )
 
     model = PPO(
         "CnnPolicy",
         env,
-        verbose=0,                           # keep console clean; our callback handles logging
+        verbose=0,  # logs are handled by our callback
         tensorboard_log=None if no_tb else log_dir,
         learning_rate=lr,
-        n_steps=n_steps,                     # per env
+        n_steps=n_steps,               # per env
         batch_size=batch_size,
         ent_coef=ent_coef,
         gamma=gamma,
         n_epochs=4,
         clip_range=0.1,
-        device=device,                       # "auto" | "cuda:0" | "cuda:1" | "cpu"
+        device=device,                 # "auto" | "cuda:0" | "cuda:1" | "cpu"
         seed=seed,
+        target_kl=target_kl,           # None to disable KL early stop
     )
 
-    cb_ckpt  = TrainAndLoggingCallback(check_freq=check_freq, save_path=ckpt_dir)
-    cb_prog  = ProgressAndMetricsCallback(total_timesteps=total_steps, print_every_steps=10_000, print_every_sec=2.0)
+    cb_ckpt = TrainAndLoggingCallback(check_freq=check_freq, save_path=ckpt_dir)
+    cb_log  = StepBucketLogger(total_timesteps=total_steps, bucket=log_bucket, window=100)
 
-    model.learn(total_timesteps=total_steps, callback=[cb_ckpt, cb_prog])
+    model.learn(total_timesteps=total_steps, callback=[cb_ckpt, cb_log])
 
     model.save(os.path.join(ckpt_dir, "final_model"))
     print(f"\nTraining finished. Checkpoints in: {ckpt_dir}")
@@ -207,32 +217,39 @@ def main(
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     # PPO budget / algo
-    ap.add_argument("--total_steps", type=int, default=8_000_000)
-    ap.add_argument("--lr", type=float, default=2.5e-4)
-    ap.add_argument("--n_steps", type=int, default=256)        # per env
-    ap.add_argument("--batch_size", type=int, default=512)
-    ap.add_argument("--ent_coef", type=float, default=0.005)
-    ap.add_argument("--gamma", type=float, default=0.999)
+    ap.add_argument("--total_steps", type=int, default=5_000_000)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--n_steps", type=int, default=128)           # per env
+    ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument("--ent_coef", type=float, default=0.01)
+    ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--check_freq", type=int, default=100_000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_envs", type=int, default=8)
-
     ap.add_argument("--device", type=str, default="auto", help='e.g., "cuda:0", "cuda:1", "cpu", or "auto"')
 
-    # Macro/repeat tuning for pipe-to-pipe
-    ap.add_argument("--pre_run_long", type=int, default=10, help="run-up frames (Right+B) from ground")
-    ap.add_argument("--pre_run_short", type=int, default=5, help="short run-up when on the first pipe")
-    ap.add_argument("--jump_hold", type=int, default=16, help="hold Right+A+B frames for long jump")
-    ap.add_argument("--k_jump", type=int, default=10, help="extra repeats when jumping")
-    ap.add_argument("--k_other", type=int, default=2, help="short taps for fine alignment")
-
-    # Visual config
+    # Visual / level
     ap.add_argument("--resize", type=int, default=84)
     ap.add_argument("--frame_stack", type=int, default=4)
     ap.add_argument("--level_id", type=str, default="SuperMarioBros-1-1-v0")
 
+    # Env toggles
+    ap.add_argument("--use_macros", action="store_true", help="Enable MacroLongJump + VariableActionRepeat")
+    ap.add_argument("--use_shaping", action="store_true", help="Enable RewardShaping")
+    ap.add_argument("--use_stuck", action="store_true", help="Enable anti-stall episode resets")
+    ap.add_argument("--use_resize", action="store_true", help="Enable ResizeObservation")
+    ap.add_argument("--action_set", type=str, default="right_only", choices=["simple", "right_only", "pipe"])
+
+    # Episode control
+    ap.add_argument("--stuck_patience", type=int, default=200)
+    ap.add_argument("--max_episode_steps", type=int, default=3000)
+
+    # PPO extra
+    ap.add_argument("--target_kl", type=float, default=None, help="KL early stopping (e.g., 0.01)")
+
     # Logging
-    ap.add_argument("--no_tb", action="store_true", help="disable TensorBoard logging")
+    ap.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
+    ap.add_argument("--log_bucket", type=int, default=50_000, help="Print metrics once per this many steps")
 
     args = ap.parse_args()
     main(**vars(args))
