@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+venvs/
+
+# Artefactos de entrenamiento
+train/
+logs/
+videos/
+*.zip
