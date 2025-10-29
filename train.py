@@ -1,6 +1,10 @@
 # train.py
-# PPO training with clean bucket logs + per-episode CSV logs.
-# Files saved under: ./train/<tag>/  ->  {best_model_*.zip, final_model.zip, episodes.csv, metrics_bucket.csv, config.json}
+# PPO training with:
+#   • periodic checkpoint snapshots
+#   • per-episode CSV logging (episodes.csv)
+#   • rolling "bucket" metrics CSV (metrics_bucket.csv) every N steps
+# Artifacts are saved under: ./train/<tag>/
+#   Files: best_model_*.zip, final_model.zip, episodes.csv, metrics_bucket.csv, config.json
 
 import warnings
 warnings.filterwarnings("ignore", message="overflow encountered", category=RuntimeWarning)
@@ -23,7 +27,7 @@ from utils import default_paths, seed_everything
 # ---------- Callbacks ----------
 
 class TrainAndLoggingCallback(BaseCallback):
-    """Save periodic checkpoints at 'check_freq' steps."""
+    """Save a model snapshot every `check_freq` calls to `_on_step()` (i.e., steps)."""
     def __init__(self, check_freq: int, save_path: str, verbose: int = 1):
         super().__init__(verbose)
         self.check_freq = int(check_freq)
@@ -31,6 +35,7 @@ class TrainAndLoggingCallback(BaseCallback):
         os.makedirs(self.save_path, exist_ok=True)
 
     def _on_step(self) -> bool:
+        # Save a checkpoint at fixed step intervals.
         if self.n_calls % self.check_freq == 0:
             model_path = os.path.join(self.save_path, f"best_model_{self.n_calls}")
             self.model.save(model_path)
@@ -39,8 +44,14 @@ class TrainAndLoggingCallback(BaseCallback):
 
 class EpisodeCSVLogger(BaseCallback):
     """
-    Write one row per *completed* episode:
-    columns = [global_step, episode_idx, reward, length, x_max, flag]
+    Append exactly one CSV row per *completed* episode to episodes.csv.
+    Columns: [global_step, episode_idx, reward, length, x_max, flag]
+      • global_step: total timesteps so far
+      • episode_idx: running episode counter across all envs
+      • reward: episodic return
+      • length: episode length (steps)
+      • x_max: maximum x position reached (from env info)
+      • flag: 1 if flag obtained (level completed), else 0
     """
     def __init__(self, save_dir: str, verbose: int = 0):
         super().__init__(verbose)
@@ -50,9 +61,10 @@ class EpisodeCSVLogger(BaseCallback):
         self.fh = None
         self.header_written = False
         self.episode_idx = 0
-        self.max_x = None  # per-env running x max
+        self.max_x = None  # per-env running max x for the current episode(s)
 
     def _ensure_max_x(self):
+        # Keep a per-env buffer for x_max (handles vectorized envs).
         try:
             n = getattr(self.training_env, "num_envs", 1)
         except Exception:
@@ -62,7 +74,7 @@ class EpisodeCSVLogger(BaseCallback):
 
     def _on_training_start(self) -> None:
         self._ensure_max_x()
-        self.fh = open(self.fpath, "a", buffering=1)  # line-buffered
+        self.fh = open(self.fpath, "a", buffering=1)  # line-buffered for immediate writes
         if not self.header_written and (self.fh.tell() == 0):
             self.fh.write("global_step,episode_idx,reward,length,x_max,flag\n")
             self.header_written = True
@@ -73,6 +85,7 @@ class EpisodeCSVLogger(BaseCallback):
         if infos is None:
             return True
 
+        # Scan per-env infos; detect episode boundaries; write rows when an episode finishes.
         for i, info in enumerate(infos):
             x = info.get("x_pos", None)
             if x is not None and i < len(self.max_x) and x > self.max_x[i]:
@@ -88,7 +101,7 @@ class EpisodeCSVLogger(BaseCallback):
                 gstep = int(self.model.num_timesteps)
                 self.fh.write(f"{gstep},{self.episode_idx},{r},{l},{x_max},{flag}\n")
                 if i < len(self.max_x):
-                    self.max_x[i] = 0  # reset for next episode
+                    self.max_x[i] = 0  # reset for the next episode in that env
 
         return True
 
@@ -101,8 +114,17 @@ class EpisodeCSVLogger(BaseCallback):
 
 class BucketCSVLogger(BaseCallback):
     """
-    Log once per fixed step bucket (e.g., every 50,000 steps) and write to metrics_bucket.csv.
-    Rolling metrics are computed over the last 'window' completed episodes.
+    Every fixed number of steps (a 'bucket', e.g. 50k or 100k), compute and print rolling metrics
+    over the last `window` completed episodes, and append a CSV row to metrics_bucket.csv.
+
+    Printed & logged fields:
+      • global_step
+      • pct (progress % of total_timesteps)
+      • sps (steps per second)
+      • elapsed_s, eta_s (seconds)
+      • episodes (completed count)
+      • ep_r100 / ep_len100 / x_max100 : rolling means over last `window` episodes
+      • flag@100 : success rate (%) over last `window` episodes
     """
     def __init__(self, save_dir: str, total_timesteps: int, bucket: int = 50_000, window: int = 100, verbose: int = 1):
         super().__init__(verbose)
@@ -117,7 +139,7 @@ class BucketCSVLogger(BaseCallback):
         self.ep_xmax    = deque(maxlen=self.window)
         self.ep_flag    = deque(maxlen=self.window)
 
-        self.max_x = None  # per-env running max x during current episode
+        self.max_x = None  # per-env running max x during the current episode
         self.start_time = 0.0
         self.last_bucket_idx = -1
         self.completed_eps = 0
@@ -127,6 +149,7 @@ class BucketCSVLogger(BaseCallback):
         self.header_written = False
 
     def _ensure_max_x(self):
+        # Maintain a vector of x_max, one per parallel env.
         try:
             n = getattr(self.training_env, "num_envs", 1)
         except Exception:
@@ -135,11 +158,11 @@ class BucketCSVLogger(BaseCallback):
             self.max_x = [0 for _ in range(n)]
 
     def _fmt(self, x):
-        # Pretty print with '-' if NaN / empty
+        # Format helper: pretty string or '-' if NaN/None.
         if x is None:
             return "-"
         try:
-            if isinstance(x, float) and (x != x):  # NaN check
+            if isinstance(x, float) and (x != x):  # NaN
                 return "-"
             return f"{x:.2f}"
         except Exception:
@@ -154,10 +177,11 @@ class BucketCSVLogger(BaseCallback):
             self.header_written = True
 
     def _maybe_log(self):
+        # Trigger logging only when we cross a bucket boundary.
         n = self.model.num_timesteps
         cur_bucket = n // self.bucket
         if cur_bucket <= self.last_bucket_idx:
-            return  # not yet crossed a bucket boundary
+            return
 
         elapsed = time.time() - self.start_time
         sps = n / max(elapsed, 1e-9)
@@ -173,7 +197,7 @@ class BucketCSVLogger(BaseCallback):
         x100 = _mean(self.ep_xmax)
         f100 = (_mean(self.ep_flag) * 100.0) if len(self.ep_flag) > 0 else float("nan")
 
-        # Console line
+        # Console line with ETA both relative and absolute time.
         elapsed_td = str(timedelta(seconds=int(elapsed)))
         eta_td = str(timedelta(seconds=int(eta_sec)))
         eta_abs = (datetime.now() + timedelta(seconds=int(eta_sec))).strftime("%H:%M:%S")
@@ -186,12 +210,13 @@ class BucketCSVLogger(BaseCallback):
             flush=True,
         )
 
-        # CSV line
+        # CSV row for the current bucket.
         self.fh.write(f"{n},{pct:.2f},{sps:.2f},{elapsed:.1f},{eta_sec:.1f},{self.completed_eps},{self._fmt(r100)},{self._fmt(l100)},{self._fmt(x100)},{self._fmt(f100)}\n")
 
         self.last_bucket_idx = cur_bucket
 
     def _on_step(self) -> bool:
+        # Consume infos to update rolling episode stats and x_max.
         self._ensure_max_x()
         infos = self.locals.get("infos", None)
         if infos is not None:
@@ -208,7 +233,7 @@ class BucketCSVLogger(BaseCallback):
                     self.ep_xmax.append(float(self.max_x[i] if i < len(self.max_x) else 0.0))
                     self.ep_flag.append(1.0 if info.get("flag_get") else 0.0)
                     if i < len(self.max_x):
-                        self.max_x[i] = 0  # reset for next episode
+                        self.max_x[i] = 0  # reset per-env tracker after episode end
 
         self._maybe_log()
         return True
@@ -250,10 +275,13 @@ def main(
     target_kl: Optional[float],
     log_bucket: int,
 ):
+    # Fix seeds for reproducibility (python/random/np/torch as implemented in seed_everything).
     seed_everything(seed)
+
+    # Create run-specific directories (e.g., ./train/ppo_s<seed>/) for checkpoints & logs.
     ckpt_dir, log_dir = default_paths(".", tag=f"ppo_s{seed}")
 
-    # Save config snapshot for reproducibility
+    # Save a self-contained config snapshot for reproducibility.
     run_cfg = dict(
         total_steps=total_steps, lr=lr, n_steps=n_steps, batch_size=batch_size,
         ent_coef=ent_coef, gamma=gamma, check_freq=check_freq, seed=seed,
@@ -265,6 +293,7 @@ def main(
     with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
         json.dump(run_cfg, f, indent=2)
 
+    # Build the vectorized Mario env with the requested wrappers/toggles.
     env = make_env(
         num_envs=num_envs,
         grayscale=True,
@@ -276,16 +305,17 @@ def main(
         use_shaping=use_shaping,
         use_stuck=use_stuck,
         action_set=action_set,
-        pre_run_long=10, pre_run_short=3, jump_hold=14,  # safe defaults
+        pre_run_long=10, pre_run_short=3, jump_hold=14,  # safe defaults for action repeats / macros
         k_jump=10, k_other=2,
         stuck_patience=stuck_patience,
         max_episode_steps=max_episode_steps,
     )
 
+    # Instantiate PPO (SB3) with a CNN policy; training verbosity handled by our callbacks.
     model = PPO(
         "CnnPolicy",
         env,
-        verbose=0,  # logs handled by our callbacks
+        verbose=0,  # console logging is done by custom callbacks
         tensorboard_log=None if no_tb else log_dir,
         learning_rate=lr,
         n_steps=n_steps,               # per env
@@ -296,15 +326,18 @@ def main(
         clip_range=0.1,
         device=device,                 # "auto" | "cuda:0" | "cuda:1" | "cpu"
         seed=seed,
-        target_kl=target_kl,           # None to disable KL early stop
+        target_kl=target_kl,           # None disables KL early stopping
     )
 
+    # Compose callbacks: snapshots, per-episode CSV, and bucketed rolling metrics.
     cb_ckpt   = TrainAndLoggingCallback(check_freq=check_freq, save_path=ckpt_dir)
     cb_epcsv  = EpisodeCSVLogger(save_dir=ckpt_dir)
     cb_bucket = BucketCSVLogger(save_dir=ckpt_dir, total_timesteps=total_steps, bucket=log_bucket, window=100)
 
+    # Train for total_timesteps with the callback list.
     model.learn(total_timesteps=total_steps, callback=[cb_ckpt, cb_epcsv, cb_bucket])
 
+    # Save a final checkpoint at the end of training.
     model.save(os.path.join(ckpt_dir, "final_model"))
     print(f"\nTraining finished. Run artifacts in: {ckpt_dir}")
     env.close()
@@ -314,14 +347,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     # PPO budget / algo
     ap.add_argument("--total_steps", type=int, default=5_000_000)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--n_steps", type=int, default=128)           # per env
-    ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument("--lr", type=float, default=2.5e-4)
+    ap.add_argument("--n_steps", type=int, default=512)          # per env
+    ap.add_argument("--batch_size", type=int, default=4096)       # must divide (n_steps * num_envs)
     ap.add_argument("--ent_coef", type=float, default=0.01)
-    ap.add_argument("--gamma", type=float, default=0.99)
+    ap.add_argument("--gamma", type=float, default=0.999)
     ap.add_argument("--check_freq", type=int, default=100_000)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--num_envs", type=int, default=8)
+    ap.add_argument("--num_envs", type=int, default=16)
     ap.add_argument("--device", type=str, default="auto", help='e.g., "cuda:0", "cuda:1", "cpu", or "auto"')
 
     # Visual / level
@@ -334,18 +367,18 @@ if __name__ == "__main__":
     ap.add_argument("--use_shaping", action="store_true", help="Enable RewardShaping")
     ap.add_argument("--use_stuck", action="store_true", help="Enable anti-stall episode resets")
     ap.add_argument("--use_resize", action="store_true", help="Enable ResizeObservation")
-    ap.add_argument("--action_set", type=str, default="right_only", choices=["simple", "right_only", "pipe"])
+    ap.add_argument("--action_set", type=str, default="pipe", choices=["simple", "right_only", "pipe"])
 
     # Episode control
-    ap.add_argument("--stuck_patience", type=int, default=200)
+    ap.add_argument("--stuck_patience", type=int, default=350)
     ap.add_argument("--max_episode_steps", type=int, default=3000)
 
     # PPO extra
-    ap.add_argument("--target_kl", type=float, default=None, help="KL early stopping (e.g., 0.01)")
+    ap.add_argument("--target_kl", type=float, default=0.01, help="KL early stopping (e.g., 0.01)")
 
     # Logging
     ap.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
-    ap.add_argument("--log_bucket", type=int, default=50_000, help="Print & CSV once per this many steps")
+    ap.add_argument("--log_bucket", type=int, default=100_000, help="Print & CSV once per this many steps")
 
     args = ap.parse_args()
     main(**vars(args))

@@ -1,6 +1,6 @@
 # mario_env.py
 # Mario + SB3: vectorized env with TimeLimit + VecMonitor + optional helpers.
-# Default pipeline: HWC -> (optionally) transpose later where needed.
+# Default pipeline: HWC → (optionally) transpose later where needed.
 
 from typing import Optional
 import gym
@@ -18,8 +18,10 @@ PIPE_ACTIONS = [
 ]
 ACTION_SETS = {"right_only": RIGHT_ONLY, "simple": SIMPLE_MOVEMENT, "pipe": PIPE_ACTIONS}
 
-# --- Optional wrappers (mínimos) ---
+# --- Optional wrappers (minimal) ---
 class VariableActionRepeat(gym.Wrapper):
+    """Repeat actions for k frames:
+       use k_jump when the combo includes 'A' (jump), otherwise k_other."""
     def __init__(self, env, actions_list, k_jump=10, k_other=2):
         super().__init__(env)
         self.actions_list = actions_list
@@ -35,6 +37,8 @@ class VariableActionRepeat(gym.Wrapper):
         return obs, total, done, info
 
 class MacroLongJump(gym.Wrapper):
+    """When a jump action is selected, enqueue a short/long run-up then hold jump:
+       right+B for a few frames, then right+A+B for jump-hold."""
     def __init__(self, env, actions_list, pre_run_long=10, pre_run_short=3, jump_hold=14):
         super().__init__(env)
         self.actions_list = actions_list
@@ -72,6 +76,7 @@ class MacroLongJump(gym.Wrapper):
         return obs, r, done, info
 
 class RewardShaping(gym.Wrapper):
+    """Add dense progress reward, give bonus for flag, penalize dying without flag."""
     def __init__(self, env, right_coef=0.02, death_penalty=-5.0, flag_reward=50.0):
         super().__init__(env)
         self.right_coef=float(right_coef); self.death_penalty=float(death_penalty)
@@ -88,6 +93,7 @@ class RewardShaping(gym.Wrapper):
         return obs, shaped, done, info
 
 class StuckReset(gym.Wrapper):
+    """Early-terminate an episode if x_pos makes no progress for 'patience' frames."""
     def __init__(self, env, patience=250):
         super().__init__(env); self.patience=int(patience)
         self._last_x=0; self._no_progress=0
@@ -101,7 +107,7 @@ class StuckReset(gym.Wrapper):
         if self._no_progress >= self.patience: done = True
         return obs, reward, done, info
 
-# --- Builders (HWC base; sin Monitor aquí) ---
+# --- Builders (HWC base; VecMonitor added after stacking) ---
 def _make_base_env(
     grayscale: bool=True, use_resize: bool=False, resize: int=84,
     seed: Optional[int]=None, level_id: str="SuperMarioBros-1-1-v0",
@@ -111,6 +117,7 @@ def _make_base_env(
     k_jump: int=10, k_other: int=2,
     stuck_patience: int=250, max_episode_steps: int=3000,
 ):
+    """Create a single Mario env with optional grayscale, resize, macros, shaping, anti-stall, and a time limit."""
     env = gym_super_mario_bros.make(level_id)
     actions = ACTION_SETS.get(action_set, RIGHT_ONLY)
     env = JoypadSpace(env, actions)
@@ -127,10 +134,6 @@ def _make_base_env(
         env.seed(seed); env.action_space.seed(seed); env.observation_space.seed(seed)
     return env
 
-
-
-# --- Builders (HWC base; sin Monitor aquí) ---
-
 def make_env(
     num_envs: int = 4,
     grayscale: bool = True,
@@ -144,14 +147,15 @@ def make_env(
     action_set: str = "pipe",
     stuck_patience: int = 200,
     max_episode_steps: int = 3000,
-    channels_order: str = "last",  # HWC stacking por defecto
-    # ⬇️ NEW: passthrough knobs for macros/repeats
+    channels_order: str = "last",  # HWC stacking by default; use VecTransposeImage later if you need CHW
+    # Passthrough knobs for macros/repeats:
     pre_run_long: int = 10,
     pre_run_short: int = 3,
     jump_hold: int = 14,
     k_jump: int = 10,
     k_other: int = 2,
 ):
+    """Build a vectorized Mario env with frame stacking and monitoring."""
     def thunk(rank: int):
         return lambda: _make_base_env(
             grayscale=grayscale,
@@ -173,7 +177,7 @@ def make_env(
         )
 
     venv = DummyVecEnv([thunk(0)]) if num_envs == 1 else SubprocVecEnv([thunk(i) for i in range(num_envs)])
-    # Importante: stack en HWC por defecto; si se quiere CHW, aplicar VecTransposeImage DESPUÉS en el script que use el env.
+    # Important: we keep HWC stacking by default; if you need CHW, add VecTransposeImage in your script after this.
     venv = VecFrameStack(venv, frame_stack, channels_order=channels_order)  # 'last' or 'first'
     venv = VecMonitor(venv)
     return venv

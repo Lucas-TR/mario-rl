@@ -1,98 +1,142 @@
 # record_video.py
-import argparse, os, time
-import imageio.v2 as imageio
-import numpy as np
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecTransposeImage
+# Render a trained PPO Mario agent and save an .mp4.
+# Auto-loads run config (config.json) and VecNormalize stats from the model's folder.
 
+import argparse
+import os
+import json
+import imageio
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecNormalize
 from mario_env import make_env
 
+def unwrap_base_env(env):
+    # Walk through vec wrappers to find the underlying base env for rgb_array rendering
+    v = env
+    seen = set()
+    while True:
+        if hasattr(v, "envs"):  # VecEnv -> take first
+            try:
+                v = v.envs[0]
+                continue
+            except Exception:
+                pass
+        if hasattr(v, "venv"):
+            v = v.venv
+            # guard against weird wrapper cycles
+            if id(v) in seen:
+                break
+            seen.add(id(v))
+            continue
+        # reached a non-vec, non-wrapped leaf (should support render)
+        return v
+
+def load_run_config(run_dir):
+    cfg_path = os.path.join(run_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return {}
+    with open(cfg_path, "r") as f:
+        return json.load(f)
+
+def default_if_none(dct, key, default):
+    v = dct.get(key, None)
+    return v if v is not None else default
+
 def main(args):
-    model = PPO.load(args.model, device=args.device)
-    obs_shape = tuple(model.observation_space.shape)  # modelo dice qué espera
+    # Infer run dir (parent of model file)
+    run_dir = os.path.dirname(os.path.abspath(args.model))
+    if os.path.basename(run_dir) == "":
+        run_dir = os.path.dirname(run_dir)
 
-    # ¿espera CHW (4,H,W) o HWC (H,W,4)?
-    expects_chw = (len(obs_shape) == 3 and obs_shape[0] in (1,3,4))
+    cfg = load_run_config(run_dir)
 
-    # Forzamos construir el env en HWC (channels_order="last"); luego transponemos si hace falta
-    use_resize = False
-    if obs_shape[0:2] == (84, 84) or obs_shape[-2:] == (84, 84):
-        use_resize = True  # si entrenaste con 84x84
-
+    # Build an env that mirrors training
     env = make_env(
         num_envs=1,
         grayscale=True,
-        use_resize=use_resize,
-        resize=84,
-        frame_stack=args.frame_stack,
-        level_id=args.level_id,
-        use_macros=args.use_macros,
-        use_shaping=args.use_shaping,
-        use_stuck=args.use_stuck,
-        action_set=args.action_set,
-        channels_order="last",   # SIEMPRE HWC aquí
-        stuck_patience=args.stuck_patience,
-        max_episode_steps=args.max_episode_steps,
+        use_resize=cfg.get("use_resize", True),
+        resize=cfg.get("resize", 84),
+        frame_stack=cfg.get("frame_stack", 4),
+        level_id=cfg.get("level_id", "SuperMarioBros-1-1-v0"),
+        use_macros=cfg.get("use_macros", True),
+        use_shaping=cfg.get("use_shaping", True),
+        use_stuck=cfg.get("use_stuck", True),
+        action_set=cfg.get("action_set", "pipe"),
+        stuck_patience=cfg.get("stuck_patience", 350),
+        max_episode_steps=cfg.get("max_episode_steps", 3000),
+        channels_order="last",
     )
 
-    if expects_chw:
-        env = VecTransposeImage(env)  # HWC -> CHW para hacer match con el modelo
-        env_shape = tuple(env.observation_space.shape)
-        if env_shape != obs_shape:
-            # si todavía no matchea, intentamos quitar resize (nativo 240x256)
-            env.close()
-            env = make_env(
-                num_envs=1, grayscale=True, use_resize=False, resize=84,
-                frame_stack=args.frame_stack, level_id=args.level_id,
-                use_macros=args.use_macros, use_shaping=args.use_shaping, use_stuck=args.use_stuck,
-                action_set=args.action_set, channels_order="last",
-                stuck_patience=args.stuck_patience, max_episode_steps=args.max_episode_steps,
-            )
-            env = VecTransposeImage(env)
-            env_shape = tuple(env.observation_space.shape)
-            if env_shape != obs_shape:
-                raise RuntimeError(f"Env {env_shape} != model {obs_shape}. Revisa si ese checkpoint fue entrenado con resize.")
+    # Attach VecNormalize stats if available
+    vecnorm_path = args.vecnorm if args.vecnorm else None
+    if vecnorm_path is None:
+        # try final first, else look for a milestone
+        cand = os.path.join(run_dir, "vecnorm_final.pkl")
+        if os.path.isfile(cand):
+            vecnorm_path = cand
+        else:
+            # find latest milestone vecnorm
+            picks = [p for p in os.listdir(run_dir) if p.startswith("vecnorm_step_") and p.endswith(".pkl")]
+            if picks:
+                # choose the max step
+                picks.sort(key=lambda s: int(s.replace("vecnorm_step_", "").replace(".pkl","")))
+                vecnorm_path = os.path.join(run_dir, picks[-1])
 
+    if vecnorm_path and os.path.isfile(vecnorm_path):
+        env = VecNormalize.load(vecnorm_path, env)
+        env.training = False
+        env.norm_reward = False
+
+    # Load model
+    model = PPO.load(args.model, device=args.device)
+
+    # Prepare video writer
     os.makedirs(args.out_dir, exist_ok=True)
-    out_path = os.path.join(args.out_dir, f"{args.prefix or 'mario'}_{int(time.time())}.mp4")
-    writer = imageio.get_writer(out_path, fps=args.fps, codec="libx264")
+    out_path = os.path.join(args.out_dir, args.output if args.output.endswith(".mp4") else args.output + ".mp4")
+    writer = imageio.get_writer(out_path, fps=args.fps)
 
-    obs = env.reset()
+    # Rollout and record
+    base_env = unwrap_base_env(env)
+    steps_limit = args.steps if args.steps > 0 else args.seconds * args.fps
     steps = 0
-    while steps < args.video_length:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, info = env.step(action)
-        frame = env.render(mode="rgb_array")
-        if isinstance(frame, list):
-            frame = frame[0]
-        if frame is None:
-            raise RuntimeError("render('rgb_array') returned None.")
-        writer.append_data(frame)
-        steps += 1
-        if done.any() if hasattr(done, "any") else bool(done):
-            obs = env.reset()
+    obs = env.reset()
 
-    writer.close(); env.close()
-    print(f"Saved video: {os.path.abspath(out_path)}")
+    try:
+        while steps_limit == 0 or steps < steps_limit:
+            action, _ = model.predict(obs, deterministic=args.deterministic)
+            obs, reward, done, info = env.step(action)
+
+            frame = base_env.render(mode="rgb_array")
+            writer.append_data(frame)
+
+            if args.render:
+                # If your setup supports a live window, NES-Py will already handle it
+                pass
+
+            if hasattr(done, "any") and done.any():
+                obs = env.reset()
+            elif isinstance(done, bool) and done:
+                obs = env.reset()
+
+            steps += 1
+    finally:
+        writer.close()
+        env.close()
+
+    print(f"Saved video to: {out_path}")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", required=True, help="Path to model zip (e.g., ./train/ppo_s42/final_model.zip or model_step_5000000.zip)")
+    ap.add_argument("--vecnorm", type=str, default=None, help="Optional path to VecNormalize stats .pkl (auto-detected if omitted)")
     ap.add_argument("--device", type=str, default="auto")
-    ap.add_argument("--out_dir", type=str, default="videos")
-    ap.add_argument("--prefix", type=str, default="run")
-    ap.add_argument("--video_length", type=int, default=6000)
+    ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--render", action="store_true", help="Show a live window if supported")
+    # recording length: choose either --seconds or --steps
+    ap.add_argument("--seconds", type=int, default=60, help="Video length in seconds (ignored if --steps > 0)")
+    ap.add_argument("--steps", type=int, default=0, help="Number of env steps to record (overrides --seconds if > 0)")
     ap.add_argument("--fps", type=int, default=30)
-
-    # Env flags (coherentes con entrenamiento)
-    ap.add_argument("--level_id", type=str, default="SuperMarioBros-1-1-v0")
-    ap.add_argument("--frame_stack", type=int, default=4)
-    ap.add_argument("--use_macros", action="store_true")
-    ap.add_argument("--use_shaping", action="store_true")
-    ap.add_argument("--use_stuck", action="store_true")
-    ap.add_argument("--action_set", type=str, default="pipe", choices=["simple","right_only","pipe"])
-    ap.add_argument("--stuck_patience", type=int, default=200)
-    ap.add_argument("--max_episode_steps", type=int, default=3000)
-
+    ap.add_argument("--out_dir", type=str, default="videos")
+    ap.add_argument("--output", type=str, default="mario_run")
     args = ap.parse_args()
     main(args)
