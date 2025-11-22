@@ -1,7 +1,0 @@
-gym-super-mario-bros==7.3.0
-opencv-python==4.12.0.88
-pip-chill==1.0.3
-stable-baselines3==1.7.0
-tensorboard==2.20.0
-torchaudio==0.13.1
-torchvision==0.14.1
