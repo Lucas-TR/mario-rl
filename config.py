@@ -24,8 +24,8 @@ N_SKIP = 4
 
 # PPO / training
 TOTAL_TIMESTEPS = int(20e6)   # 20M steps
-LEARNING_RATE = 3e-4
-N_ENVS = 1
+LEARNING_RATE = 2.5e-4
+N_ENVS = 4
 
 # Base directories for models and logs
 BASE_MODEL_DIR = ROOT_DIR / "models" / "ppo_ram_notebook"
